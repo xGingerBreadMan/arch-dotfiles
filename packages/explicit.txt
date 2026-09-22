@@ -11,6 +11,7 @@ dunst
 efibootmgr
 file-roller
 git
+github-cli
 gst-plugin-pipewire
 htop
 illogical-impulse-audio

@@ -10,6 +10,7 @@ dunst
 efibootmgr
 file-roller
 git
+github-cli
 gst-plugin-pipewire
 htop
 intel-ucode
