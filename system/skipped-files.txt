@@ -1,11 +1,5 @@
 .config/fish/fish_variables
-.config/quickshell/ii/assets/icons/ai-openai-symbolic.svg (symlink; documented separately)
-.config/quickshell/ii/assets/icons/fluent/cloudflare-filled.svg (symlink; documented separately)
-.config/quickshell/ii/assets/icons/fluent/cloudflare.svg (symlink; documented separately)
-.config/quickshell/ii/assets/icons/google-gemini-symbolic.svg (symlink; documented separately)
 .config/quickshell/ii/modules/common/widgets/shapes/.git
 .config/quickshell/ii/modules/ii/deadlines/DeadlineTheme.qml.bak
 .config/quickshell/pibble-wallpaper/.git
 .config/quickshell/pibble-wallpaper/shell.qml.original
-.config/systemd/user/default.target.wants/ydotool.service (symlink; documented separately)
-.config/systemd/user/timers.target.wants/myls-calendar-sync.timer (symlink; documented separately)
