@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Sync a MyLS iCalendar share feed; no nonstandard Python dependencies."""
+import json
+import os
+import re
+import sys
+import tempfile
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+HOME = Path.home()
+CONFIG = HOME / '.config/myls-calendar'
+CACHE = HOME / '.cache/myls-calendar'
+LOCAL_TZ = ZoneInfo((CONFIG / 'timezone').read_text().strip() if (CONFIG / 'timezone').exists() else 'America/Toronto')
+
+
+def atomic_write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.' + path.name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def parse_date(value, params):
+    try:
+        if params.get('VALUE') == 'DATE' or re.fullmatch(r'\d{8}', value):
+            day = datetime.strptime(value, '%Y%m%d')
+            return day.replace(hour=23, minute=59, second=59, tzinfo=LOCAL_TZ)
+        if value.endswith('Z'):
+            return datetime.strptime(value, '%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc).astimezone(LOCAL_TZ)
+        tz = ZoneInfo(params.get('TZID', str(LOCAL_TZ)))
+        form = '%Y%m%dT%H%M%S' if len(value) >= 15 else '%Y%m%dT%H%M'
+        return datetime.strptime(value, form).replace(tzinfo=tz).astimezone(LOCAL_TZ)
+    except (ValueError, KeyError):
+        return None
+
+
+def parse_feed(text, now=None):
+    if 'BEGIN:VCALENDAR' not in text.upper() or 'END:VCALENDAR' not in text.upper():
+        raise ValueError('The link did not return an iCalendar feed. Use the calendar share link.')
+    lines = re.sub(r'\r?\n[ \t]', '', text).splitlines()
+    events, props, kind, depth = [], None, '', 0
+    for line in lines:
+        if line.upper() in ('BEGIN:VEVENT', 'BEGIN:VTODO'):
+            props, kind, depth = {}, line.split(':')[1].lower(), 0
+        elif props is not None and line.upper() in ('END:VEVENT', 'END:VTODO'):
+            events.append((kind, props))
+            props = None
+        elif props is not None:
+            if line.upper().startswith('BEGIN:'):
+                depth += 1
+            elif line.upper().startswith('END:'):
+                depth = max(0, depth - 1)
+            elif depth == 0 and ':' in line:
+                head, value = line.split(':', 1)
+                bits = head.split(';')
+                params = dict((k.upper(), v.strip('"')) for k, v in (bit.split('=', 1) for bit in bits[1:] if '=' in bit))
+                value = re.sub(r'\\([nN,;\\])', lambda m: '\n' if m[1].lower() == 'n' else m[1], value)
+                props.setdefault(bits[0].upper(), (params, value))
+    now = datetime.now(LOCAL_TZ) if now is None else now
+    items = {}
+    for kind, props in events:
+        def field(name):
+            return props.get(name, ({}, ''))[1]
+        due, source = None, ''
+        for key in ('DUE', 'DTSTART'):
+            if key in props:
+                due = parse_date(props[key][1], props[key][0])
+                if due:
+                    source = key
+                    break
+        title = field('SUMMARY').strip()
+        if not title or not due or due < now - timedelta(days=30) or field('STATUS').upper() == 'CANCELLED':
+            continue
+        uid = field('UID').strip() or title + '|' + due.isoformat()
+        items[(uid, due.isoformat())] = dict(id=uid, title=title, course=None, due=due.isoformat(), due_unix=int(due.timestamp()),
+            source_field=source, description=field('DESCRIPTION'), location=field('LOCATION'), url=field('URL'), kind=kind)
+    return sorted(items.values(), key=lambda x: x['due_unix'])
+
+
+def main():
+    CACHE.mkdir(parents=True, exist_ok=True)
+    feed = CONFIG / 'feed.url'
+    if not feed.exists() or not feed.read_text().strip():
+        print('Open Deadline Center Settings to add your calendar share link.')
+        return 0
+    try:
+        url = feed.read_text().strip()
+        if url.startswith('webcal://'):
+            url = 'https://' + url[len('webcal://'):]
+        if not url.startswith(('https://', 'http://')):
+            raise ValueError('Use an HTTP(S) calendar share link.')
+        request = urllib.request.Request(url, headers={'User-Agent': 'MyLS-Deadline-Center/1.0', 'Accept': 'text/calendar'})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            text = response.read().decode('utf-8-sig', errors='replace')
+        items = parse_feed(text)
+        # A calendar changed while downloading: discard this response.
+        current = feed.read_text().strip().replace('webcal://', 'https://', 1)
+        if current != url:
+            raise ValueError('Calendar changed during sync. Retry Sync.')
+        updated = datetime.now(LOCAL_TZ).isoformat()
+        atomic_write(CACHE / 'calendar.ics', text)
+        atomic_write(CACHE / 'deadlines.json', json.dumps(dict(updated=updated, timezone=str(LOCAL_TZ), count=len(items), items=items), ensure_ascii=False, indent=2))
+        atomic_write(CACHE / 'status.json', json.dumps(dict(ok=True, updated=updated, count=len(items), error=None)))
+        print(f'Synced {len(items)} calendar items.')
+        return 0
+    except Exception:
+        # Do not log the private share URL from a network exception.
+        message = 'Calendar sync failed. Check the share link and network connection.'
+        atomic_write(CACHE / 'status.json', json.dumps(dict(ok=False, updated=datetime.now(LOCAL_TZ).isoformat(), error=message)))
+        print(message, file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

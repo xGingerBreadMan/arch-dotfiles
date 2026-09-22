@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""Local MyLS presentation adapter and atomic custom-task store (stdlib only)."""
+import fcntl
+import hashlib
+import html
+import json
+import math
+import colorsys
+import os
+import re
+import sys
+import shutil
+import subprocess
+from html.parser import HTMLParser
+from urllib.parse import unquote, urlparse
+import tempfile
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+PALETTE = ['#82b4ff', '#ce9cff', '#69d9bc', '#ffbd7a', '#f594b8', '#c3d977', '#78cfe7', '#d9a78d']
+COURSE_RE = re.compile(r'\b([A-Z]{2,5})[ -]?(\d{3}[A-Z]?)\b')
+
+
+def plain(value):
+    return html.unescape(re.sub(r'<[^>]*>', '', str(value or ''))).strip()
+
+
+def web_url(value):
+    value = str(value or '').strip()
+    return value if value.startswith(('https://', 'http://')) and not any(c.isspace() for c in value) else ''
+
+
+def read_object(path, fallback=None):
+    if not path.exists():
+        return {} if fallback is None else fallback
+    result = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(result, dict):
+        raise ValueError(f'{path.name} must contain a JSON object.')
+    return result
+
+
+def timezone_for(home):
+    try:
+        return ZoneInfo(read_object(home / '.cache/myls-calendar/deadlines.json').get('timezone') or 'America/Toronto')
+    except (OSError, ValueError, KeyError, TypeError):
+        return ZoneInfo('America/Toronto')
+
+
+def local_due(value, tz):
+    result = datetime.fromisoformat(str(value))
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=tz)
+        # Reject nonexistent spring-forward local times instead of silently shifting them.
+        if datetime.fromtimestamp(result.timestamp(), tz).replace(tzinfo=None) != result.replace(tzinfo=None):
+            raise ValueError('That local time does not exist because the clocks change. Choose another time.')
+    return result.astimezone(tz)
+
+
+def countdown(seconds):
+    minutes = max(1, math.ceil(abs(seconds) / 60))
+    days, remainder = divmod(minutes, 1440)
+    hours, mins = divmod(remainder, 60)
+    return f'{days}d {hours}h' if days else f'{hours}h {mins}m' if hours else f'{mins}m'
+
+
+def ics_metadata(path):
+    """Recover fields omitted by the existing sync script without changing it."""
+    try:
+        text = re.sub(r'\r?\n[ \t]', '', path.read_text(encoding='utf-8-sig'))
+    except OSError:
+        return {}
+    output, current = {}, None
+    for line in text.splitlines():
+        if line.upper() in ('BEGIN:VEVENT', 'BEGIN:VTODO'):
+            current = {}
+        elif line.upper() in ('END:VEVENT', 'END:VTODO'):
+            if current and current.get('UID'):
+                output[current['UID']] = current
+            current = None
+        elif current is not None and ':' in line:
+            head, value = line.split(':', 1)
+            key = head.split(';', 1)[0].upper()
+            value = value.replace('\\n', '\n').replace('\\N', '\n').replace('\\,', ',').replace('\\;', ';')
+            if key in ('UID', 'CATEGORIES', 'DESCRIPTION', 'URL', 'X-ALT-DESC', 'X-WR-CALNAME', 'LOCATION'):
+                current[key] = value
+    return output
+
+
+def course_parts(value):
+    text = plain(value)
+    match = COURSE_RE.search(text)
+    if len(set(COURSE_RE.findall(text))) > 1:
+        return '', ''
+    if not match:
+        return '', ''
+    code = match[1] + '-' + match[2]
+    tail = text[match.end():].strip()
+    # Section identifiers such as -VA1, -BR1, -OC1 and -A are not course titles.
+    tail = re.sub(r'^-\s*[A-Z]{1,3}\d{0,2}(?=\s*[-–—:·]|$)', '', tail)
+    name = tail.lstrip(' -–—:·').strip()
+    if COURSE_RE.search(name) or 'http' in name:
+        name = ''
+    return code, name
+
+
+def identify_course(item, meta, override):
+    sources = [override.get('course'), item.get('location'), meta.get('LOCATION'),
+               meta.get('CATEGORIES'), item.get('course')]
+    description_lines = plain(item.get('description') or meta.get('DESCRIPTION')).splitlines()
+    sources += [line for line in description_lines if COURSE_RE.match(line.strip())]
+    explicit = plain(override.get('course'))
+    if explicit:
+        code, name = course_parts(explicit)
+        code = code or explicit
+    else:
+        code, name = '', ''
+        for value in sources:
+            found, title = course_parts(value)
+            if found:
+                code, name = found, title
+                break
+    if code:
+        for value in sources:
+            found, title = course_parts(value)
+            if found == code and title and not name:
+                name = title
+        name = plain(override.get('courseName') or item.get('courseName')) or name
+        return code, name or code
+    search = '\n'.join(str(v or '') for v in [item.get('title'), item.get('description'), meta.get('DESCRIPTION')])
+    codes = sorted(set('-'.join(match) for match in COURSE_RE.findall(search)))
+    if len(codes) == 1:
+        return codes[0], codes[0]
+    fallback = plain(item.get('course') or meta.get('CATEGORIES'))
+    if fallback and ',' not in fallback and fallback.lower() not in {'assignment', 'assignments', 'quiz', 'quizzes', 'event', 'events', 'due date'}:
+        return fallback, fallback
+    return 'Unassigned', 'Course not identified'
+
+
+class PaperParser(HTMLParser):
+    """Keep document formatting but remove active content, URLs and feed footers."""
+    tags = {'p', 'br', 'b', 'strong', 'i', 'em', 'u', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'blockquote', 'table', 'tr', 'td', 'th', 'hr'}
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.hidden = 0
+        self.skip_link = False
+    def handle_starttag(self, tag, attrs):
+        if tag in ('script', 'style'):
+            self.hidden += 1
+        if self.hidden:
+            return
+        if tag == 'a':
+            href = dict(attrs).get('href', '')
+            self.skip_link = '/dropbox/' in href.lower() or '/le/calendar/' in href.lower()
+        if tag in self.tags:
+            self.parts.append('<' + tag + '>')
+        elif tag == 'div':
+            self.parts.append('<p>')
+    def handle_endtag(self, tag):
+        if tag in ('script', 'style'):
+            self.hidden = max(0, self.hidden - 1)
+            return
+        if self.hidden:
+            return
+        if tag == 'a':
+            self.skip_link = False
+        if tag in self.tags and tag not in ('br', 'hr'):
+            self.parts.append('</' + tag + '>')
+        elif tag == 'div':
+            self.parts.append('</p>')
+    def handle_data(self, data):
+        if self.hidden or self.skip_link:
+            return
+        self.parts.append(html.escape(data))
+
+
+def clean_description(value, course):
+    raw = str(value or '')
+    # Brightspace appends two navigation blocks after the actual assignment text.
+    # Drop complete labelled blocks, including titles and wrapped links.
+    raw = re.sub(r'(?is)(?:^|\n|<br\s*/?>|<p[^>]*>|<div[^>]*>)[ \t]*(?:<[^>]+>)*[ \t]*(?:Dropbox\s*:|View event\s*(?:-|:)).*$', '', raw)
+    raw = re.sub(r'https?://[^\s<>"\']+', '', raw)
+    lines = raw.splitlines()
+    kept = []
+    for line in lines:
+        code, name = course_parts(line)
+        if code == course and COURSE_RE.match(plain(line)):
+            continue
+        kept.append(line)
+    raw = '\n'.join(kept).strip()
+    if not re.search(r'<(?:p|div|br|b|strong|em|i|h[1-4]|ul|ol|li)\b', raw, re.I):
+        rich = '<p>' + html.escape(html.unescape(raw)).replace('\n\n', '</p><p>').replace('\n', '<br>') + '</p>' if raw else ''
+    else:
+        parser = PaperParser()
+        parser.feed(raw)
+        rich = ''.join(parser.parts)
+    text = re.sub(r'<(?:/p|/div|br\s*/?|/li|/h[1-4])>', '\n', rich)
+    text = plain(text)
+    return text, rich if text else ''
+
+
+def pdf_path(value, home):
+    value = str(value or '')
+    if value.startswith('file:'):
+        parsed = urlparse(value)
+        if parsed.netloc not in ('', 'localhost'):
+            raise ValueError('Choose a local PDF file.')
+        value = unquote(parsed.path)
+    if value.startswith('~/'):
+        value = str(home / value[2:])
+    path = Path(value)
+    if not path.is_absolute() or not path.is_file():
+        raise ValueError('The selected PDF could not be found.')
+    with path.open('rb') as source:
+        if b'%PDF-' not in source.read(1024):
+            raise ValueError('Choose a PDF document.')
+    return path
+
+
+def import_pdf(value, home):
+    source = pdf_path(value, home)
+    folder = home / '.local/share/myls-calendar/pdfs'
+    folder.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    with source.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    destination = folder / (digest.hexdigest() + '.pdf')
+    if not destination.exists():
+        fd, name = tempfile.mkstemp(dir=folder, prefix='.copy-')
+        os.close(fd)
+        try:
+            shutil.copyfile(source, name)
+            os.replace(name, destination)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+    return str(destination)
+
+
+def preview_pdf(home, value, page):
+    source = pdf_path(value, home)
+    if not shutil.which('pdftoppm') or not shutil.which('pdfinfo'):
+        raise ValueError('PDF previews need Poppler. Install with: sudo pacman -S poppler')
+    env = dict(os.environ, LC_ALL='C')
+    info = subprocess.run(['pdfinfo', str(source)], capture_output=True, text=True, timeout=20, env=env)
+    match = re.search(r'^Pages:\s+(\d+)', info.stdout, re.M)
+    if info.returncode or not match:
+        raise ValueError('Cannot preview this PDF. It may be encrypted or damaged.')
+    pages = int(match[1])
+    page = max(1, min(int(page), pages))
+    stat = source.stat()
+    key = hashlib.sha256(f'{source}|{stat.st_mtime_ns}|{stat.st_size}'.encode()).hexdigest()
+    cache = home / '.cache/myls-calendar/pdf-previews' / key
+    cache.mkdir(parents=True, exist_ok=True)
+    output = cache / f'page-{page}.png'
+    if not output.exists():
+        # Unique output prefix avoids partially written images across open views.
+        with tempfile.TemporaryDirectory(dir=cache) as temp:
+            prefix = str(Path(temp) / 'page')
+            result = subprocess.run(['pdftoppm', '-f', str(page), '-l', str(page), '-singlefile', '-scale-to', '1600', '-png', str(source), prefix], capture_output=True, timeout=40)
+            if result.returncode:
+                raise ValueError('Could not render this PDF page.')
+            os.replace(prefix + '.png', output)
+    return dict(ok=True, image=output.as_uri(), page=page, pages=pages)
+
+
+def atomic_text(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def valid_color(color):
+    return isinstance(color, str) and re.fullmatch(r'#[0-9a-fA-F]{6}', color) is not None
+
+
+def rgb_linear(color):
+    rgb = [int(color[i:i+2], 16) / 255 for i in (1, 3, 5)]
+    return [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in rgb]
+
+
+def lab(color):
+    r, g, b = rgb_linear(color)
+    xyz = [(0.4124564*r + 0.3575761*g + 0.1804375*b)/0.95047,
+           0.2126729*r + 0.7151522*g + 0.072175*b,
+           (0.0193339*r + 0.119192*g + 0.9503041*b)/1.08883]
+    x,y,z = [v ** (1/3) if v > 0.008856 else 7.787*v + 16/116 for v in xyz]
+    return (116*y - 16, 500*(x-y), 200*(y-z))
+
+
+def label_text(color):
+    r,g,b=rgb_linear(color)
+    lum=0.2126*r + 0.7152*g + 0.0722*b
+    return '#101521' if lum > 0.20 else '#ffffff'
+
+
+def distinct_color(used):
+    candidates = ['#82b4ff', '#ffb347', '#64dda5', '#e593ef', '#f3e26f', '#ff8697', '#69dce9']
+    for hue in range(0,360,20):
+        for light in (0.62,0.74):
+            rgb = colorsys.hls_to_rgb(hue/360,light,0.75)
+            candidates.append('#' + ''.join(f'{round(c*255):02x}' for c in rgb))
+    if not used:
+        return candidates[0]
+    used_lab=[lab(c) for c in used if valid_color(c)]
+    return max(candidates, key=lambda c: min(sum((a-b)**2 for a,b in zip(lab(c),other)) for other in used_lab)) if used_lab else candidates[0]
+
+
+def class_settings(home, rows):
+    config = home / '.config/myls-calendar'
+    config.mkdir(parents=True, exist_ok=True)
+    path=config/'deadline-center.json'
+    with (config/'deadline-center.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        state=read_object(path, {'version':1,'tasks':{},'overrides':{}})
+        before=json.dumps(state,sort_keys=True)
+        prefs=state.setdefault('settings',{})
+        if not isinstance(prefs,dict):
+            raise ValueError('Saved settings must be an object.')
+        auto=prefs.setdefault('autoColors',{})
+        custom=prefs.setdefault('classColors',{})
+        if not isinstance(auto,dict) or not isinstance(custom,dict):
+            raise ValueError('Saved class colours must be an object.')
+        courses={row['course']:row['courseName'] for row in rows}
+        effective={c:custom.get(c) or auto.get(c) for c in courses}
+        used=[v for v in effective.values() if valid_color(v)]
+        for course in sorted(courses):
+            if not valid_color(effective[course]):
+                auto[course]=distinct_color(used)
+                effective[course]=auto[course]
+                used.append(auto[course])
+        if json.dumps(state,sort_keys=True) != before:
+            atomic_text(path,json.dumps(state,indent=2,ensure_ascii=False)+'\n')
+    classes=[dict(code=c,name=courses[c],color=effective[c],textColor=label_text(effective[c]),custom=valid_color(custom.get(c))) for c in sorted(courses)]
+    for row in rows:
+        row['color']=effective[row['course']]
+        row['labelColor']=label_text(row['color'])
+    return classes,prefs
+
+
+def snapshot(home, now=None):
+    tz = timezone_for(home)
+    now = datetime.now(tz).timestamp() if now is None else now
+    today = datetime.fromtimestamp(now, tz).date()
+    week_end = today + timedelta(days=6 - today.weekday())
+    config = home / '.config/myls-calendar'
+    cache = home / '.cache/myls-calendar'
+    warnings, data = [], {}
+    cache_ok = False
+    try:
+        data = read_object(cache / 'deadlines.json')
+        cache_ok = isinstance(data.get('items'), list)
+        if not cache_ok:
+            raise ValueError()
+    except (OSError, ValueError):
+        warnings.append('MyLS cache unavailable. Sync to load imported deadlines; custom tasks still work.')
+        data = {}
+    def optional(filename, default):
+        try:
+            return read_object(config / filename, default)
+        except (OSError, ValueError):
+            warnings.append(f'Could not read {filename}; the file has not been changed.')
+            return default
+    attachments = optional('attachments.json', {})
+    state = optional('deadline-center.json', {'tasks': {}, 'overrides': {}})
+    tasks = state.get('tasks', {})
+    overrides = state.get('overrides', {})
+    if not isinstance(tasks, dict) or not isinstance(overrides, dict):
+        tasks, overrides = {}, {}
+        warnings.append('Invalid saved task data; the file has not been changed.')
+    prefs = state.get('settings', {})
+    if not isinstance(prefs, dict):
+        prefs = {}
+    feed_pending = False
+    try:
+        feed_pending = local_due(data.get('updated'), tz).timestamp() < float(prefs.get('feedPendingSince', 0))
+    except (ValueError, TypeError):
+        feed_pending = bool(prefs.get('feedPendingSince'))
+    if feed_pending:
+        cache_ok = False
+        warnings.append('New calendar saved. Waiting for its first successful sync.')
+    metadata = ics_metadata(cache / 'calendar.ics')
+    try:
+        if read_object(cache / 'status.json').get('ok') is False:
+            warnings.append('Last MyLS sync failed; showing saved deadlines.')
+    except (OSError, ValueError):
+        pass
+    all_rows = []
+    imported = data.get('items', []) if cache_ok else []
+    for item in imported + list(tasks.values()):
+        try:
+            if not isinstance(item, dict):
+                raise ValueError()
+            custom = item.get('source') == 'custom'
+            uid = str(item['id'])
+            due = local_due(item['due'], tz)
+            key = uid if custom else uid + '|' + str(item['due'])
+            override = overrides.get(key, {})
+            if not isinstance(override, dict):
+                override = {}
+            attached = attachments.get(uid, {})
+            if not isinstance(attached, dict):
+                attached = {}
+            meta = metadata.get(uid, {})
+            course, course_name = identify_course(item, meta, override)
+            if custom:
+                if course == 'Unassigned':
+                    course = course_name = 'Personal'
+            description, description_html = clean_description(meta.get('X-ALT-DESC') or item.get('description') or meta.get('DESCRIPTION'), course)
+            raw_desc = str(item.get('description') or '') + '\n' + str(meta.get('DESCRIPTION') or '') + '\n' + str(meta.get('X-ALT-DESC') or '')
+            links = [web_url(html.unescape(link).rstrip('.,;)')) for link in re.findall(r'https?://[^\s<>"\']+', raw_desc)]
+            url = web_url(override.get('url') or attached.get('url') or item.get('url') or meta.get('URL'))
+            dropbox = web_url(override.get('dropbox') or attached.get('dropbox') or item.get('dropbox'))
+            if not dropbox:
+                dropbox = next((link for link in [url] + links if '/dropbox/' in link.lower()), '')
+            file = override.get('file', attached.get('file', item.get('file', ''))) or ''
+            if isinstance(file, str) and file.startswith('~/'):
+                file = str(home / file[2:])
+            if not isinstance(file, str) or not file.startswith('/'):
+                file = ''
+            seconds = due.timestamp() - now
+            completed = bool(override.get('completed', item.get('completed', False)))
+            color = override.get('color') or item.get('color') or PALETTE[int(hashlib.sha256(course.upper().encode()).hexdigest()[:8], 16) % len(PALETTE)]
+            if not re.fullmatch(r'#[0-9a-fA-F]{6}', str(color)):
+                color = PALETTE[0]
+            group = 'Due Today:' if due.date() == today else 'Due This Week:' if today < due.date() <= week_end else 'Coming Up:'
+            row = dict(id=uid, key=key, title=plain(item['title']), course=course, courseName=course_name,
+                       color=color, due=due.timestamp(), dueISO=due.isoformat(), day=due.date().isoformat(),
+                       date=due.strftime('%a, %b %d, %Y · %I:%M %p %Z'), time=due.strftime('%I:%M %p'),
+                       editDate=due.strftime('%Y-%m-%d'), editTime=due.strftime('%H:%M'),
+                       description=description, descriptionHtml=description_html, notes=plain(override.get('notes', item.get('notes', ''))),
+                       location=plain(item.get('location')), countdown='Completed' if completed else countdown(seconds) + (' ago' if seconds < 0 else ' left'),
+                       short=countdown(seconds), urgent=not completed and 0 <= seconds <= 64800,
+                       url=url, dropbox=dropbox, file=file, past=seconds < 0, completed=completed,
+                       custom=custom, group='Past Due!' if seconds < 0 and not completed else group)
+            all_rows.append(row)
+        except (ValueError, KeyError, TypeError, OverflowError, OSError):
+            warnings.append('Some invalid calendar entries were skipped.')
+    try:
+        classes, prefs = class_settings(home, all_rows)
+    except (OSError, ValueError, TypeError):
+        classes = []
+        warnings.append('Could not update class colours; saved settings have not been replaced.')
+        for row in all_rows:
+            row['labelColor'] = label_text(row['color'])
+    try:
+        feed_url = (config / 'feed.url').read_text(encoding='utf-8').strip()
+    except OSError:
+        feed_url = ''
+    all_rows.sort(key=lambda row: row['due'])
+    upcoming = [row for row in all_rows if not row['past'] and not row['completed']]
+    overdue = [row for row in all_rows if row['past'] and not row['completed']]
+    finished = sorted([row for row in all_rows if row['completed']], key=lambda row: row['due'], reverse=True)
+    updated = 'Not synced'
+    try:
+        stamp = local_due(data['updated'], tz)
+        updated = stamp.strftime('%b %d · %I:%M %p %Z')
+        if now - stamp.timestamp() > 3600:
+            warnings.append('MyLS cache is over an hour old.')
+    except (KeyError, ValueError, TypeError):
+        pass
+    return dict(ok=True, cacheOk=cache_ok, upcoming=upcoming, overdue=overdue, finished=finished, all=all_rows,
+                classes=classes, settings=dict(theme=prefs.get('theme','system'), feedUrl=feed_url, feedPending=feed_pending),
+                today=today.isoformat(), timezone=str(tz), updated=updated, message=' '.join(dict.fromkeys(warnings)))
+
+
+def mutate(home, payload):
+    if not isinstance(payload, dict):
+        raise ValueError('Invalid task request.')
+    config = home / '.config/myls-calendar'
+    config.mkdir(parents=True, exist_ok=True)
+    path = config / 'deadline-center.json'
+    with (config / 'deadline-center.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read_object(path, {'version': 1, 'tasks': {}, 'overrides': {}})
+        for field in ('tasks', 'overrides'):
+            if not isinstance(state.setdefault(field, {}), dict):
+                raise ValueError('Saved task data is invalid. Repair deadline-center.json before saving.')
+        action = payload.get('action')
+        key = str(payload.get('key') or '')
+        if action == 'saveCustom':
+            if key and key not in state['tasks']:
+                raise ValueError('This custom task no longer exists.')
+            title = str(payload.get('title') or '').strip()
+            if not title:
+                raise ValueError('Enter a task title.')
+            due = local_due(payload.get('due'), timezone_for(home))
+            key = key or 'custom-' + uuid.uuid4().hex
+            row = dict(state['tasks'].get(key, {}))
+            row.update(id=key, source='custom', title=title, due=due.isoformat())
+            for field in ('course', 'courseName', 'description', 'notes', 'url', 'dropbox', 'file'):
+                row[field] = str(payload.get(field) or '').strip()
+            for field in ('url', 'dropbox'):
+                if row[field] and not web_url(row[field]):
+                    raise ValueError('Links must begin with https:// or http:// and contain no spaces.')
+            if payload.get('attachPdf'):
+                row['file'] = import_pdf(payload['attachPdf'], home)
+            state['tasks'][key] = row
+        elif action == 'saveDetails':
+            if not key:
+                raise ValueError('Missing deadline identifier.')
+            row = dict(state['overrides'].get(key, {}))
+            for field in ('course', 'courseName', 'notes', 'url', 'dropbox', 'file'):
+                row[field] = str(payload.get(field) or '').strip()
+            for field in ('url', 'dropbox'):
+                if row[field] and not web_url(row[field]):
+                    raise ValueError('Links must begin with https:// or http:// and contain no spaces.')
+            if payload.get('attachPdf'):
+                row['file'] = import_pdf(payload['attachPdf'], home)
+            state['overrides'][key] = row
+        elif action == 'complete':
+            if not key:
+                raise ValueError('Missing deadline identifier.')
+            if key in state['tasks']:
+                state['tasks'][key]['completed'] = bool(payload.get('completed'))
+            else:
+                state['overrides'].setdefault(key, {})['completed'] = bool(payload.get('completed'))
+        elif action == 'saveTheme':
+            theme = payload.get('theme')
+            if theme not in ('system','light','dark'):
+                raise ValueError('Choose system, light or dark theme.')
+            state.setdefault('settings', {})['theme'] = theme
+        elif action == 'saveClassColor':
+            course = str(payload.get('course') or '').strip()
+            if not course:
+                raise ValueError('Choose a class.')
+            prefs = state.setdefault('settings', {})
+            custom = prefs.setdefault('classColors', {})
+            auto = prefs.setdefault('autoColors', {})
+            color = payload.get('color')
+            if color is None:
+                custom.pop(course, None)
+                auto[course] = distinct_color([custom.get(c) or auto.get(c) for c in set(auto) | set(custom) if c != course])
+            elif valid_color(color):
+                custom[course] = color.lower()
+            else:
+                raise ValueError('Use a six-digit hex colour such as #82b4ff.')
+        elif action == 'saveFeed':
+            url = str(payload.get('url') or '').strip()
+            if url.startswith('webcal://'):
+                url = 'https://' + url[len('webcal://'):]
+            parsed = urlparse(url)
+            if not web_url(url) or not parsed.hostname or parsed.username or parsed.password:
+                raise ValueError('Paste an HTTP(S) or webcal calendar share link.')
+            prefs = state.setdefault('settings', {})
+            prefs['feedPendingSince'] = datetime.now().timestamp()
+            atomic_text(config/'feed.url',url+'\n')
+        elif action == 'deleteCustom':
+            if key not in state['tasks']:
+                raise ValueError('This custom task no longer exists.')
+            del state['tasks'][key]
+            state['overrides'].pop(key, None)
+        else:
+            raise ValueError('Unknown task action.')
+        fd, temp = tempfile.mkstemp(prefix='.deadline-center-', dir=config)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as output:
+                json.dump(state, output, ensure_ascii=False, indent=2)
+                output.write('\n')
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temp, path)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+    return {'ok': True, 'key': key, 'action': action, 'needsSync': action == 'saveFeed'}
+
+
+if __name__ == '__main__':
+    try:
+        if len(sys.argv) == 4 and sys.argv[1] == 'preview':
+            result = preview_pdf(Path.home(), sys.argv[2], sys.argv[3])
+        elif len(sys.argv) == 3 and sys.argv[1] == 'mutate':
+            result = mutate(Path.home(), json.loads(sys.argv[2]))
+        else:
+            result = snapshot(Path.home())
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
+        result = {'ok': False, 'message': str(error)}
+    print(json.dumps(result, ensure_ascii=False))

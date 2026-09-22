@@ -1,0 +1,10 @@
+*.tar.gz
+*.zip
+.env
+.env.*
+*.pem
+*.key
+**/feed.url
+**/fish_variables
+**/__pycache__/
+**/.DS_Store

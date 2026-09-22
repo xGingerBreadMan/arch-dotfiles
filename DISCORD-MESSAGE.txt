@@ -1,0 +1,4 @@
+Hey Missilepenguin — here’s my Arch/Hyprland dotfiles backup, including Illogical Impulse, the Pibble wallpaper picker, my package lists, and restore notes. It’s from my NVIDIA laptop, so check the hardware settings first. Run `python restore.py` to preview; `--apply` backs up existing files before restoring. Private feeds and login data aren’t included.
+
+GitHub: [private repository URL pending upload — ask me for access]
+Attachment: dotfiles-2026-09-22.tar.gz

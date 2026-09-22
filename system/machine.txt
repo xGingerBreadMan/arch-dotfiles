@@ -1,0 +1,10 @@
+Snapshot: 2026-09-22
+OS: Arch Linux
+Kernel: 7.2.2-arch1-1
+Model: Victus by HP Gaming Laptop 16-r0xxx
+GPU: NVIDIA GeForce RTX 4050 Laptop GPU
+Display: eDP-1 1920x1080 144Hz scale 1
+Filesystem: Btrfs
+Bootloader: systemd-boot
+Display manager: SDDM
+Interactive shell: Fish

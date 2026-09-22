@@ -1,0 +1,8 @@
+singleton DeadlineStore 1.0 DeadlineStore.qml
+singleton DeadlineTheme 1.0 DeadlineTheme.qml
+DeadlineButton 1.0 DeadlineButton.qml
+DeadlineCard 1.0 DeadlineCard.qml
+DeadlineCalendar 1.0 DeadlineCalendar.qml
+DeadlineEditor 1.0 DeadlineEditor.qml
+DeadlinePaper 1.0 DeadlinePaper.qml
+DeadlineSettings 1.0 DeadlineSettings.qml
